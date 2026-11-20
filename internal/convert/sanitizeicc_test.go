@@ -37,7 +37,11 @@ func iccChunksOf(t *testing.T, raw []byte) (seqs []int, counts []int, assembled 
 		}
 		end := i + 2 + segLen
 		if marker == 0xDA {
-			i = skipEntropyCodedScan(raw, end)
+			next, err := skipEntropyCodedScan(raw, end)
+			if err != nil {
+				break
+			}
+			i = next
 			continue
 		}
 		if p := raw[i+4 : end]; marker == 0xE2 && bytes.HasPrefix(p, tag) && len(p) >= 14 {
@@ -215,7 +219,7 @@ func TestVerifierAgreesWithTheSanitizerAboutICCSets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if what, found := jpegMetadataResidue(out); found {
+	if what, found, err := jpegMetadataResidue(out); err != nil || found {
 		t.Errorf("the verifier calls the sanitizer's own output residue: %s", what)
 	}
 

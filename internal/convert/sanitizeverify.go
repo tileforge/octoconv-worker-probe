@@ -1134,7 +1134,11 @@ func verifierICCSetComplete(raw []byte) bool {
 		}
 		end := i + 2 + segLen
 		if marker == 0xDA {
-			i = skipEntropyCodedScan(raw, end)
+			next, err := skipEntropyCodedScan(raw, end)
+			if err != nil {
+				return false
+			}
+			i = next
 			continue
 		}
 		if payload := raw[i+4 : end]; marker == 0xE2 && bytes.HasPrefix(payload, tag) {
@@ -1186,13 +1190,13 @@ func verifierICCSetComplete(raw []byte) bool {
 
 // jpegMetadataResidue walks a JPEG's segment chain and reports any APPn or COM
 // segment that is not one of the allowed colour-management segments.
-func jpegMetadataResidue(raw []byte) (string, bool) {
+func jpegMetadataResidue(raw []byte) (string, bool, error) {
 	iccSetComplete := verifierICCSetComplete(raw)
 
 	i := 2 // past SOI
 	for i+1 < len(raw) {
 		if raw[i] != 0xFF {
-			return "", false // malformed; the decode check above already ruled
+			return "", false, nil // malformed; the decode check above already ruled
 		}
 		// Fill bytes before a marker, same rule as the sanitizer's walker and
 		// as skipEntropyCodedScan below. Without it this walker stopped early
@@ -1206,7 +1210,7 @@ func jpegMetadataResidue(raw []byte) (string, bool) {
 			continue
 		}
 		if marker == 0xD9 { // EOI
-			return "", false
+			return "", false, nil
 		}
 		if marker == 0xDA {
 			// SOS. The scan's compressed bytes carry no segments, but the
@@ -1218,33 +1222,37 @@ func jpegMetadataResidue(raw []byte) (string, bool) {
 			// one wrong assumption prove nothing at all. Caught in review
 			// (PR #12, round 3).
 			if i+4 > len(raw) {
-				return "", false
+				return "", false, nil
 			}
 			segLen := int(binary.BigEndian.Uint16(raw[i+2 : i+4]))
 			if segLen < 2 || i+2+segLen > len(raw) {
-				return "", false
+				return "", false, nil
 			}
-			i = skipEntropyCodedScan(raw, i+2+segLen)
+			next, err := skipEntropyCodedScan(raw, i+2+segLen)
+			if err != nil {
+				return "", false, err
+			}
+			i = next
 			continue
 		}
 		if i+4 > len(raw) {
-			return "", false
+			return "", false, nil
 		}
 		segLen := int(binary.BigEndian.Uint16(raw[i+2 : i+4]))
 		if segLen < 2 || i+2+segLen > len(raw) {
-			return "", false
+			return "", false, nil
 		}
 		end := i + 2 + segLen
 
 		isAPP := marker >= 0xE0 && marker <= 0xEF
 		if isAPP || marker == 0xFE {
 			if !jpegSegmentAllowed(marker, raw[i+4:end], iccSetComplete) {
-				return fmt.Sprintf("APP%d/COM segment 0x%02X at offset %d", marker-0xE0, marker, i), true
+				return fmt.Sprintf("APP%d/COM segment 0x%02X at offset %d", marker-0xE0, marker, i), true, nil
 			}
 		}
 		i = end
 	}
-	return "", false
+	return "", false, nil
 }
 
 // skipEntropyCodedScan returns the offset of the next real marker after a
@@ -1256,7 +1264,7 @@ func jpegMetadataResidue(raw []byte) (string, bool) {
 // helper here would make this check prove that the helper agrees with itself.
 // The rule itself -- FF 00 is stuffing, FF D0..D7 are restart markers, a run
 // of FF is padding -- comes from ISO/IEC 10918-1, not from the other function.
-func skipEntropyCodedScan(b []byte, from int) int {
+func skipEntropyCodedScan(b []byte, from int) (int, error) {
 	i := from
 	for i+1 < len(b) {
 		if b[i] != 0xFF {
@@ -1267,14 +1275,17 @@ func skipEntropyCodedScan(b []byte, from int) int {
 		for j+1 < len(b) && b[j+1] == 0xFF {
 			j++
 		}
+		if j+1 >= len(b) {
+			return 0, fmt.Errorf("%w: JPEG scan ended on a fill byte", ErrSanitizeMalformedInput)
+		}
 		next := b[j+1]
 		if next == 0x00 || (next >= 0xD0 && next <= 0xD7) {
 			i = j + 2
 			continue
 		}
-		return j
+		return j, nil
 	}
-	return len(b)
+	return len(b), nil
 }
 
 // pngMetadataResidue walks a PNG's chunk chain and reports any chunk whose
@@ -1366,7 +1377,10 @@ func verifyImage(ctx context.Context, x engineExec, _, path string) ([]ThreatCla
 	var isResidue bool
 	switch format {
 	case "jpeg":
-		found, isResidue = jpegMetadataResidue(raw)
+		found, isResidue, err = jpegMetadataResidue(raw)
+		if err != nil {
+			return nil, err
+		}
 	case "png":
 		found, isResidue = pngMetadataResidue(raw)
 	default:

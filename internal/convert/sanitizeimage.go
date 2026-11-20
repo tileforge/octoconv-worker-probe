@@ -197,7 +197,10 @@ func walkJPEGSegments(src []byte, visit func(jpegMarkerSegment)) error {
 			// review (PR #12, round 3), and reproduced before it was fixed.
 			// The SOS header is not an APP or COM segment, so every caller
 			// keeps it, and its scan travels with it.
-			end := endOfEntropyCodedData(src, segEnd)
+			end, err := endOfEntropyCodedData(src, segEnd)
+			if err != nil {
+				return err
+			}
 			seg.scan = src[segEnd:end]
 			visit(seg)
 			i = end
@@ -386,7 +389,7 @@ func iccChunkSetIsValid(src []byte) (bool, error) {
 //
 // Anything else after an 0xFF ends the scan. A run of padding 0xFF bytes
 // before a marker is legal and is handled by looking past it.
-func endOfEntropyCodedData(b []byte, from int) int {
+func endOfEntropyCodedData(b []byte, from int) (int, error) {
 	for i := from; i+1 < len(b); i++ {
 		if b[i] != 0xFF {
 			continue
@@ -396,14 +399,17 @@ func endOfEntropyCodedData(b []byte, from int) int {
 		for j+1 < len(b) && b[j+1] == 0xFF {
 			j++
 		}
+		if j+1 >= len(b) {
+			return 0, fmt.Errorf("%w: JPEG scan ended on a fill byte", ErrSanitizeMalformedInput)
+		}
 		next := b[j+1]
 		if next == 0x00 || (next >= 0xD0 && next <= 0xD7) {
 			i = j
 			continue
 		}
-		return j
+		return j, nil
 	}
-	return len(b)
+	return len(b), nil
 }
 
 // pngMetadataChunks is the closed set of PNG chunk types that carry metadata.

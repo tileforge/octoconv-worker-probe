@@ -8,7 +8,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"image"
-	_ "image/jpeg"
+	"image/jpeg"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -609,8 +609,44 @@ func TestSanitizeImageAcceptsMarkerFillBytes(t *testing.T) {
 
 	// And the verifier must have walked past the fill bytes too, or its
 	// verdict covers only what it happened to reach.
-	if found, isResidue := jpegMetadataResidue(withFill); !isResidue {
-		t.Errorf("the verifier called the UNSANITIZED file clean (found=%q); it stops at the "+
-			"fill bytes and never sees the APP1 behind them", found)
+	if found, isResidue, err := jpegMetadataResidue(withFill); err != nil || !isResidue {
+		t.Errorf("the verifier called the UNSANITIZED file clean (found=%q, err=%v); it stops at the "+
+			"fill bytes and never sees the APP1 behind them", found, err)
+	}
+}
+
+func TestStripJPEGMetadataRejectsTrailingFill(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	if len(raw) < 2 || raw[len(raw)-2] != 0xFF || raw[len(raw)-1] != 0xD9 {
+		t.Fatalf("encoded JPEG has no EOI: %x", raw[len(raw)-2:])
+	}
+	raw[len(raw)-1] = 0xFF
+	if _, _, err := image.DecodeConfig(bytes.NewReader(raw)); err != nil {
+		t.Fatalf("DecodeConfig rejected the fixture, so it does not match the reported input: %v", err)
+	}
+
+	_, err := stripJPEGMetadata(raw)
+	if !errors.Is(err, ErrSanitizeMalformedInput) {
+		t.Fatalf("stripJPEGMetadata: %v", err)
+	}
+	if _, err := endOfEntropyCodedData(raw, len(raw)-2); !errors.Is(err, ErrSanitizeMalformedInput) {
+		t.Fatalf("endOfEntropyCodedData: %v", err)
+	}
+	if _, err := skipEntropyCodedScan(raw, len(raw)-2); !errors.Is(err, ErrSanitizeMalformedInput) {
+		t.Fatalf("skipEntropyCodedScan: %v", err)
+	}
+
+	in := filepath.Join(t.TempDir(), "in.jpg")
+	if err := os.WriteFile(in, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = sanitizeImage(context.Background(), engineExec{}, in, filepath.Join(t.TempDir(), "out.jpg"))
+	if !errors.Is(err, ErrSanitizeMalformedInput) {
+		t.Fatalf("sanitizeImage: %v", err)
 	}
 }

@@ -749,11 +749,11 @@ func TestVerifierRejectsPaddedAdobeMarker(t *testing.T) {
 		p = append(p, size...)
 		return append(p, bytes.Repeat([]byte{0xAA}, extra)...)
 	}
-	if _, found := jpegMetadataResidue(buildJPEGWithSegments(t, jpegSegment(0xE2, icc(64, 60)))); found {
-		t.Error("a well-formed ICC chunk was reported as residue")
+	if _, found, err := jpegMetadataResidue(buildJPEGWithSegments(t, jpegSegment(0xE2, icc(64, 60)))); err != nil || found {
+		t.Errorf("a well-formed ICC chunk was reported as residue: %v", err)
 	}
-	if _, found := jpegMetadataResidue(buildJPEGWithSegments(t, jpegSegment(0xE2, icc(8, 200)))); !found {
-		t.Error("an ICC chunk carrying far more than its profile declares was accepted")
+	if _, found, err := jpegMetadataResidue(buildJPEGWithSegments(t, jpegSegment(0xE2, icc(8, 200)))); err != nil || !found {
+		t.Errorf("an ICC chunk carrying far more than its profile declares was accepted: %v", err)
 	}
 }
 
