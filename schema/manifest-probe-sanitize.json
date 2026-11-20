@@ -1,0 +1,27 @@
+{
+  "capabilities": [
+    {
+      "id": "octoconv.sanitize.probe",
+      "version": 1,
+      "legacy": {"operation": "sanitize", "engine": "probe"},
+      "client_operation": "sanitize",
+      "inputs": [{"role": "source", "min": 1, "max": 1}],
+      "outputs": [
+        {"role": "primary", "min": 1, "max": 1},
+        {"role": "report", "min": 1, "max": 1}
+      ],
+      "parameter_schema": {},
+      "formats": [
+        {"from": "docm", "to": "docx"},
+        {"from": "docx", "to": "docx"},
+        {"from": "jpg", "to": "jpg"},
+        {"from": "pdf", "to": "pdf"},
+        {"from": "png", "to": "png"},
+        {"from": "pptm", "to": "pptx"},
+        {"from": "pptx", "to": "pptx"},
+        {"from": "xlsm", "to": "xlsx"},
+        {"from": "xlsx", "to": "xlsx"}
+      ]
+    }
+  ]
+}
