@@ -11,7 +11,10 @@ package convert
 // A frame whose width or height is not a multiple of its MCU is not moved
 // this way. The edge block holds both the last visible samples and the
 // encoder's padding, so a block permutation pulls that padding into the new
-// frame. Those files are decoded and encoded again.
+// frame. Those files are decoded and encoded again. image/jpeg.Encode writes
+// a new file and does not emit the source APP2 or APP14 segments, so the
+// colour segments already kept in the stripped input are placed back after
+// the new SOI.
 
 import (
 	"bytes"
@@ -163,6 +166,10 @@ func orientJPEG(src []byte, orient int) ([]byte, error) {
 }
 
 func orientJPEGPixels(src []byte, orient int) ([]byte, error) {
+	kept, err := keptJPEGColourSegments(src)
+	if err != nil {
+		return nil, err
+	}
 	img, err := jpeg.Decode(bytes.NewReader(src))
 	if err != nil {
 		return nil, fmt.Errorf("%w: JPEG orientation: %v", ErrSanitizeMalformedInput, err)
@@ -171,7 +178,41 @@ func orientJPEGPixels(src []byte, orient int) ([]byte, error) {
 	if err := jpeg.Encode(&buf, orientRaster(img, orient), &jpeg.Options{Quality: 100}); err != nil {
 		return nil, fmt.Errorf("%w: JPEG orientation: %v", ErrSanitizeMalformedInput, err)
 	}
-	return stripJPEGSegments(buf.Bytes())
+	out, err := stripJPEGSegments(buf.Bytes())
+	if err != nil || len(kept) == 0 {
+		return out, err
+	}
+	return insertJPEGSegmentsAfterSOI(out, kept)
+}
+
+func keptJPEGColourSegments(src []byte) ([][]byte, error) {
+	keepICC, err := iccChunkSetIsValid(src)
+	if err != nil {
+		return nil, err
+	}
+	var kept [][]byte
+	err = walkJPEGSegments(src, func(seg jpegMarkerSegment) {
+		switch {
+		case keepICC && isJPEGICCChunk(seg.marker, seg.payload):
+			kept = append(kept, bytes.Clone(seg.raw))
+		case isKeptJPEGAppSegment(seg.marker, seg.payload):
+			kept = append(kept, bytes.Clone(seg.raw))
+		}
+	})
+	return kept, err
+}
+
+func insertJPEGSegmentsAfterSOI(src []byte, segs [][]byte) ([]byte, error) {
+	if len(src) < 2 || src[0] != 0xFF || src[1] != 0xD8 {
+		return nil, fmt.Errorf("%w: not a JPEG (no SOI)", ErrSanitizeMalformedInput)
+	}
+	var out bytes.Buffer
+	out.Write(src[:2])
+	for _, seg := range segs {
+		out.Write(seg)
+	}
+	out.Write(src[2:])
+	return out.Bytes(), nil
 }
 
 func orientRaster(src image.Image, orient int) *image.RGBA {

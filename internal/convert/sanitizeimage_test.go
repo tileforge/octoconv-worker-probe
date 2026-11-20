@@ -724,6 +724,67 @@ func TestSanitizeImageAppliesEXIFOrientation(t *testing.T) {
 			t.Fatalf("stripJPEGMetadata: %v", err)
 		}
 	})
+
+	t.Run("partial mcu keeps icc", func(t *testing.T) {
+		assertColourSurvivesOrientation(t, colorRamp(40, 20), 6, false)
+	})
+
+	t.Run("aligned mcu keeps icc", func(t *testing.T) {
+		assertColourSurvivesOrientation(t, colorRamp(32, 16), 6, true)
+	})
+}
+
+func assertColourSurvivesOrientation(t *testing.T, img image.Image, orient int, lossless bool) {
+	t.Helper()
+	iccPayload := []byte("probe-icc-orient-profile")
+	adobePayload := append([]byte("Adobe"), 0x00, 0x64, 0, 0, 0, 0, 2)
+	raw := prependJPEGSegments(t, jpegWithOrientation(t, img, orient),
+		jpegSegment(0xE2, iccChunk(1, 1, iccPayload)),
+		jpegSegment(0xEE, adobePayload),
+	)
+	out := sanitizeJPEGBytes(t, raw)
+	if !bytes.Contains(out, iccPayload) {
+		t.Fatal("ICC profile was dropped")
+	}
+	if !bytes.Contains(out, adobePayload) {
+		t.Fatal("Adobe APP14 was dropped")
+	}
+	if bytes.Contains(out, []byte("Exif\x00\x00")) {
+		t.Fatal("EXIF survived")
+	}
+	got := decodeJPEG(t, out)
+	wantW, wantH := img.Bounds().Dx(), img.Bounds().Dy()
+	if orient >= 5 {
+		wantW, wantH = wantH, wantW
+	}
+	if got.Bounds().Dx() != wantW || got.Bounds().Dy() != wantH {
+		t.Fatalf("size = %v, want %dx%d", got.Bounds(), wantW, wantH)
+	}
+	srcQ := jpegQuantTables(t, raw)
+	gotQ := jpegQuantTables(t, out)
+	same := quantTablesEqual(srcQ, gotQ)
+	transposed := quantTablesEqual(transposeQuantTables(srcQ), gotQ)
+	if lossless {
+		if !transposed {
+			t.Fatal("aligned MCU did not transpose the quant tables")
+		}
+		return
+	}
+	if same || transposed {
+		t.Fatal("partial MCU took the coefficient path")
+	}
+}
+
+func prependJPEGSegments(t *testing.T, raw []byte, segs ...[]byte) []byte {
+	t.Helper()
+	if len(raw) < 2 || raw[0] != 0xFF || raw[1] != 0xD8 {
+		t.Fatal("not a JPEG")
+	}
+	out := append([]byte{}, raw[:2]...)
+	for _, seg := range segs {
+		out = append(out, seg...)
+	}
+	return append(out, raw[2:]...)
 }
 
 func assertOrientedJPEG(t *testing.T, img image.Image, orient, tol int, lossless bool) {
