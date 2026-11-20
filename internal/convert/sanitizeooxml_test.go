@@ -498,6 +498,34 @@ func TestResolveTargetKeepsPackageAbsolute(t *testing.T) {
 	if got := resolveTarget(rels, "vbaProject.bin"); got != "word/vbaProject.bin" {
 		t.Fatalf("sibling target resolved to %q", got)
 	}
+	if got := resolveTarget(rels, "document.xml#bookmark"); got != "word/document.xml" {
+		t.Fatalf("fragment target resolved to %q", got)
+	}
+	if got := resolveTarget(rels, "/word/document.xml#bookmark"); got != "word/document.xml" {
+		t.Fatalf("absolute fragment target resolved to %q", got)
+	}
+	if got := resolveTarget(rels, "#bookmark"); got != "word/document.xml" {
+		t.Fatalf("bare fragment resolved to %q", got)
+	}
+}
+
+func TestRewriteRelsKeepsBookmarkFragment(t *testing.T) {
+	raw := []byte(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+		`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="document.xml#bookmark"/>` +
+		`</Relationships>`)
+	out, removed, err := rewriteRels("word/_rels/document.xml.rels", raw, nil, map[string]bool{
+		"word/document.xml": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed {
+		t.Fatal("an internal bookmark was treated as an external relationship")
+	}
+	if !bytes.Contains(out, []byte(`Target="document.xml#bookmark"`)) {
+		t.Fatalf("bookmark relationship was dropped: %s", out)
+	}
 }
 
 func TestSanitizeOOXMLKeepsPackageAbsoluteImage(t *testing.T) {

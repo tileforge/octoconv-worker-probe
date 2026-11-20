@@ -455,6 +455,26 @@ func TestVerifierDoesNotScanPDFStreamPayloads(t *testing.T) {
 	_ = withMarkers
 }
 
+func TestScanPDFBytesMatchesWholeNames(t *testing.T) {
+	font := []byte("%PDF-1.4\n1 0 obj\n<< /BaseFont /AABCDE+Test /URIFont /URIFONT >>\nendobj\n%%EOF\n")
+	got, err := scanPDFBytes(font)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("a subset font name reported %v", got)
+	}
+
+	action := []byte("%PDF-1.4\n1 0 obj\n<< /AA << /O 2 0 R >> /A#41 <<>> >>\nendobj\n%%EOF\n")
+	got, err = scanPDFBytes(action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != ThreatActionDict {
+		t.Fatalf("scanPDFBytes = %v, want [%s]", got, ThreatActionDict)
+	}
+}
+
 // TestVerifierCatchesRelationshipResidue is the regression proof for the
 // fifteenth finding of PR #12, and the third time in one review that the
 // remover moved and the checker did not.

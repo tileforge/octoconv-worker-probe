@@ -294,7 +294,16 @@ func isDroppedPart(name string, content []byte) (bool, ThreatClass) {
 // package root. Any other target is resolved against the part its .rels file
 // describes, so "vbaProject.bin" inside word/_rels/document.xml.rels resolves
 // to "word/vbaProject.bin".
+//
+// The target is a URI. The '#' and the fragment after it are not part of the
+// package part, so "document.xml#bookmark" is the part "document.xml".
 func resolveTarget(relsPath, target string) string {
+	if i := strings.IndexByte(target, '#'); i >= 0 {
+		target = target[:i]
+	}
+	if target == "" {
+		return relsSourcePart(relsPath)
+	}
 	if strings.HasPrefix(target, "/") {
 		return path.Clean(strings.TrimLeft(target, "/"))
 	}
@@ -303,6 +312,24 @@ func resolveTarget(relsPath, target string) string {
 		base = ""
 	}
 	return path.Clean(path.Join(base, target))
+}
+
+// relsSourcePart is the part a .rels file describes. A target that is only a
+// fragment names that part.
+func relsSourcePart(relsPath string) string {
+	dir, file := path.Split(path.Clean(relsPath))
+	if path.Base(path.Clean(dir)) != "_rels" {
+		return ""
+	}
+	name := strings.TrimSuffix(file, ".rels")
+	if name == "" || strings.HasPrefix(name, ".") {
+		return ""
+	}
+	parent := path.Dir(path.Clean(dir))
+	if parent == "." {
+		return name
+	}
+	return path.Join(parent, name)
 }
 
 // rewriteContentTypes rebuilds [Content_Types].xml against the SURVIVOR set,

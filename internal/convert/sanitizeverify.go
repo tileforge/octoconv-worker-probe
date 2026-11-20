@@ -212,12 +212,13 @@ var pdfActionResidue = map[string]ThreatClass{
 // -- the only place these names can carry meaning -- lies in the plain bytes
 // this still scans. Skipping stream payloads costs no reach.
 var pdfByteResidue = map[string]ThreatClass{
-	"/JavaScript":  ThreatJavaScript,
-	"/OpenAction":  ThreatActionDict,
-	"/AA":          ThreatActionDict,
-	"/Launch":      ThreatLaunchAction,
-	"EmbeddedFile": ThreatEmbeddedFile,
-	"/URI":         ThreatExternalReference,
+	"/JavaScript":    ThreatJavaScript,
+	"/OpenAction":    ThreatActionDict,
+	"/AA":            ThreatActionDict,
+	"/Launch":        ThreatLaunchAction,
+	"/EmbeddedFile":  ThreatEmbeddedFile,
+	"/EmbeddedFiles": ThreatEmbeddedFile,
+	"/URI":           ThreatExternalReference,
 	// D-09 removes the XMP packet whole, so the metadata check is binary:
 	// the packet is not there. Checking field-by-field would fail on an
 	// honest file that legitimately has none of those fields, and checking
@@ -424,13 +425,88 @@ func scanPDFBytes(raw []byte) ([]ThreatClass, error) {
 	}
 	seen := map[ThreatClass]bool{}
 	var found []ThreatClass
-	for marker, class := range pdfByteResidue {
-		if bytes.Contains(outside, []byte(marker)) && !seen[class] {
+	add := func(class ThreatClass) {
+		if !seen[class] {
 			seen[class] = true
 			found = append(found, class)
 		}
 	}
+	// A PDF name runs from '/' to the next delimiter. "/AA" is a prefix of
+	// the subset-font name "/AABCDE+Test", so a substring search reports an
+	// additional-actions dictionary that is not there.
+	for i := 0; i < len(outside); i++ {
+		if outside[i] != '/' {
+			continue
+		}
+		name, ok := pdfNameAt(outside, i)
+		if !ok {
+			continue
+		}
+		if class, ok := pdfByteResidue["/"+name]; ok {
+			add(class)
+		}
+	}
+	for marker, class := range pdfByteResidue {
+		if strings.HasPrefix(marker, "/") {
+			continue
+		}
+		if bytes.Contains(outside, []byte(marker)) {
+			add(class)
+		}
+	}
 	return sortClasses(found), nil
+}
+
+// pdfNameAt returns the PDF name that starts at b[i], which must be '/'.
+// A '#' and two hex digits are one character of the name. The name ends at a
+// delimiter, so "/AA" does not match the leading bytes of "/AABCDE+Test".
+func pdfNameAt(b []byte, i int) (string, bool) {
+	if i >= len(b) || b[i] != '/' {
+		return "", false
+	}
+	var name []byte
+	for j := i + 1; j < len(b); {
+		c := b[j]
+		if pdfNameDelim(c) {
+			break
+		}
+		if c == '#' && j+2 < len(b) && pdfHex(b[j+1]) && pdfHex(b[j+2]) {
+			name = append(name, pdfHexValue(b[j+1])<<4|pdfHexValue(b[j+2]))
+			j += 3
+			continue
+		}
+		name = append(name, c)
+		j++
+	}
+	if len(name) == 0 {
+		return "", false
+	}
+	return string(name), true
+}
+
+func pdfNameDelim(c byte) bool {
+	switch c {
+	case 0, '\t', '\n', '\f', '\r', ' ',
+		'(', ')', '<', '>', '[', ']', '{', '}', '/', '%':
+		return true
+	default:
+		return false
+	}
+}
+
+func pdfHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'A' && c <= 'F' || c >= 'a' && c <= 'f'
+}
+
+func pdfHexValue(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10
+	default:
+		return c - 'a' + 10
+	}
 }
 
 // pdfNonStreamBytes returns the file with every stream payload blanked out,
