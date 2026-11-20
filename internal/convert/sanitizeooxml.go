@@ -38,21 +38,13 @@ package convert
 // promises macros that are no longer there is a lie of exactly the kind Phase
 // 59 spent a plan removing from comments. The extension follows the content
 // type because the content type is what changed.
-//
-// WHY NO SECOND STRUCTURAL CEILING
-//
-// This code deliberately does NOT introduce its own zip entry/size bound.
-// Two already exist -- internal/api's inspectMaxZipDirEntries (applied at
-// upload, before any of this runs) and internal/inspect's maxZipEntriesScanned
-// -- and a third declaration would be a third place to forget when the number
-// moves. The worker's own ENGINE_TIMEOUT and container memory limit are the
-// backstop for anything that reaches here.
 
 import (
 	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -297,15 +289,15 @@ func isDroppedPart(name string, content []byte) (bool, ThreatClass) {
 	return false, ""
 }
 
-// resolveTarget resolves a relationship Target against the part its .rels file
+// resolveTarget resolves a relationship Target to a package part name.
+// A target that starts with '/' is package-absolute and is taken from the
+// package root. Any other target is resolved against the part its .rels file
 // describes, so "vbaProject.bin" inside word/_rels/document.xml.rels resolves
 // to "word/vbaProject.bin".
-//
-// Without this, a relationship pointing at a dropped part would look like a
-// relationship to some other file entirely and be carried forward, leaving the
-// orphan this whole file exists to avoid.
 func resolveTarget(relsPath, target string) string {
-	target = strings.TrimPrefix(target, "/")
+	if strings.HasPrefix(target, "/") {
+		return path.Clean(strings.TrimLeft(target, "/"))
+	}
 	base := path.Dir(path.Dir(relsPath)) // strip "_rels/<name>.rels"
 	if base == "." {
 		base = ""
@@ -414,6 +406,81 @@ func xmlAttr(s string) string {
 	return b.String()
 }
 
+// ZIP uncompressed-size fields are not a bound: a local header can name a
+// small size while deflate expands without limit. These ceilings count bytes
+// actually read.
+const (
+	ooxmlPartBytes    int64 = MaxFileBytes
+	ooxmlArchiveBytes int64 = MaxFileBytes
+)
+
+type ooxmlMember struct {
+	name    string
+	content []byte
+}
+
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+func readBounded(ctx context.Context, r io.Reader, n int64) ([]byte, error) {
+	if n < 0 {
+		n = 0
+	}
+	buf, err := io.ReadAll(io.LimitReader(ctxReader{ctx: ctx, r: r}, n+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(buf)) > n {
+		return nil, ErrOutputTooLarge
+	}
+	return buf, nil
+}
+
+func loadOOXMLParts(ctx context.Context, files []*zip.File, partMax, totalMax int64) ([]ooxmlMember, error) {
+	var all []ooxmlMember
+	var total int64
+	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, fmt.Errorf("%w: open part %s: %v", ErrSanitizeMalformedInput, f.Name, err)
+		}
+		limit := partMax
+		remain := totalMax - total
+		if remain < limit {
+			limit = remain
+		}
+		content, err := readBounded(ctx, rc, limit)
+		rc.Close()
+		if err != nil {
+			if errors.Is(err, ErrOutputTooLarge) {
+				return nil, fmt.Errorf("%w: decompressed OOXML part %s", ErrOutputTooLarge, f.Name)
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: read part %s: %v", ErrSanitizeMalformedInput, f.Name, err)
+		}
+		total += int64(len(content))
+		all = append(all, ooxmlMember{name: f.Name, content: content})
+	}
+	return all, nil
+}
+
 // sanitizeOOXML rebuilds inPath into outPath without the macro project, OLE
 // objects, embedded attachments, document properties or external references,
 // and with the container's own wiring made consistent with what remains.
@@ -432,29 +499,12 @@ func sanitizeOOXML(ctx context.Context, _ engineExec, inPath, outPath string) (S
 	// before any rewriting, because [Content_Types].xml and the .rels files
 	// must be rewritten against the FINAL survivor set, not against a partial
 	// one -- a relationship to a part dropped later in the walk would survive.
-	type part struct {
-		name    string
-		content []byte
+	all, err := loadOOXMLParts(ctx, zr.File, ooxmlPartBytes, ooxmlArchiveBytes)
+	if err != nil {
+		return SanitizeResult{}, err
 	}
-	var all []part
 	dropped := map[string]bool{}
 	removedClasses := map[ThreatClass]bool{}
-
-	for _, f := range zr.File {
-		if f.FileInfo().IsDir() {
-			continue
-		}
-		rc, err := f.Open()
-		if err != nil {
-			return SanitizeResult{}, fmt.Errorf("%w: open part %s: %v", ErrSanitizeMalformedInput, f.Name, err)
-		}
-		content, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			return SanitizeResult{}, fmt.Errorf("%w: read part %s: %v", ErrSanitizeMalformedInput, f.Name, err)
-		}
-		all = append(all, part{name: f.Name, content: content})
-	}
 
 	// Every .rels file is read BEFORE anything is dropped: a relationship in
 	// one .rels can name a part that a name-or-content check would carry
@@ -474,7 +524,7 @@ func sanitizeOOXML(ctx context.Context, _ engineExec, inPath, outPath string) (S
 		}
 	}
 
-	var parts []part
+	var parts []ooxmlMember
 	for _, p := range all {
 		if dropped[p.name] {
 			continue
@@ -542,8 +592,6 @@ func sanitizeOOXML(ctx context.Context, _ engineExec, inPath, outPath string) (S
 	if err := os.WriteFile(outPath, out.Bytes(), 0o644); err != nil {
 		return SanitizeResult{}, fmt.Errorf("sanitize ooxml: write output: %w", err)
 	}
-
-	_ = ctx // the rebuild is pure Go; no external process to cancel
 
 	return SanitizeResult{
 		Removed:          append([]ThreatClass(nil), ooxmlThreatClasses...),

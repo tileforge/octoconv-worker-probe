@@ -6,8 +6,8 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -134,7 +134,7 @@ func ooxmlConsistency(t *testing.T, archive []byte) []string {
 				problems = append(problems, name+" still carries an external relationship: "+r.Target)
 				continue
 			}
-			target := path.Clean(path.Join(path.Dir(path.Dir(name)), strings.TrimPrefix(r.Target, "/")))
+			target := resolveTarget(name, r.Target)
 			if !present[target] {
 				problems = append(problems, name+" points at missing part: "+target)
 			}
@@ -484,5 +484,160 @@ func TestSanitizeMalformedInputIsDistinguishable(t *testing.T) {
 					"exhausts its retries without MarkFailed, and leaves the job active", tc.why, err)
 			}
 		})
+	}
+}
+
+func TestResolveTargetKeepsPackageAbsolute(t *testing.T) {
+	const rels = "word/_rels/document.xml.rels"
+	if got := resolveTarget(rels, "/word/media/image1.png"); got != "word/media/image1.png" {
+		t.Fatalf("absolute target resolved to %q", got)
+	}
+	if got := resolveTarget(rels, "media/image1.png"); got != "word/media/image1.png" {
+		t.Fatalf("relative target resolved to %q", got)
+	}
+	if got := resolveTarget(rels, "vbaProject.bin"); got != "word/vbaProject.bin" {
+		t.Fatalf("sibling target resolved to %q", got)
+	}
+}
+
+func TestSanitizeOOXMLKeepsPackageAbsoluteImage(t *testing.T) {
+	const image = "word/media/image1.png"
+	rels := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+		`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="/word/media/image1.png"/>` +
+		`</Relationships>`
+	in := filepath.Join(t.TempDir(), "in.docx")
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range map[string][]byte{
+		"[Content_Types].xml":          []byte(`<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="png" ContentType="image/png"/></Types>`),
+		"word/document.xml":            []byte(`<?xml version="1.0"?><document/>`),
+		"word/_rels/document.xml.rels": []byte(rels),
+		image:                          []byte("png-bytes"),
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(in, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "out.docx")
+	if _, err := sanitizeOOXML(context.Background(), engineExec{}, in, out); err != nil {
+		t.Fatalf("sanitizeOOXML: %v", err)
+	}
+	blob, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(blob), int64(len(blob)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := map[string][]byte{}
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts[f.Name] = buf
+	}
+	if !bytes.Equal(parts[image], []byte("png-bytes")) {
+		t.Fatalf("package-absolute image = %q", parts[image])
+	}
+	relsOut := parts["word/_rels/document.xml.rels"]
+	if !bytes.Contains(relsOut, []byte(`Target="/word/media/image1.png"`)) {
+		t.Fatalf("package-absolute relationship was rewritten away: %s", relsOut)
+	}
+	if dangling := ooxmlConsistency(t, blob); len(dangling) > 0 {
+		t.Fatalf("dangling: %v", dangling)
+	}
+}
+
+type countReader struct {
+	n   int
+	src io.Reader
+}
+
+func (c *countReader) Read(p []byte) (int, error) {
+	n, err := c.src.Read(p)
+	c.n += n
+	return n, err
+}
+
+func TestReadBoundedStopsAtTheCeiling(t *testing.T) {
+	cr := &countReader{src: bytes.NewReader(bytes.Repeat([]byte{'a'}, 1000))}
+	_, err := readBounded(context.Background(), cr, 10)
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("ceiling: %v", err)
+	}
+	if cr.n != 11 {
+		t.Fatalf("read %d bytes, want 11", cr.n)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = readBounded(ctx, bytes.NewReader(bytes.Repeat([]byte{'a'}, 100)), 50)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel: %v", err)
+	}
+}
+
+func TestLoadOOXMLPartsEnforcesBothCeilings(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, item := range []struct {
+		name string
+		body string
+	}{
+		{"a.txt", strings.Repeat("a", 20)},
+		{"b.txt", strings.Repeat("b", 20)},
+	} {
+		w, err := zw.Create(item.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(item.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = loadOOXMLParts(context.Background(), zr.File, 16, 100)
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("part ceiling: %v", err)
+	}
+	_, err = loadOOXMLParts(context.Background(), zr.File, 100, 30)
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("archive ceiling: %v", err)
+	}
+	got, err := loadOOXMLParts(context.Background(), zr.File, 100, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || int64(len(got[0].content)+len(got[1].content)) != 40 {
+		t.Fatalf("parts %#v", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = loadOOXMLParts(ctx, zr.File, 100, 100)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel: %v", err)
 	}
 }
