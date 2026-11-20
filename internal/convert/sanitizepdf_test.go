@@ -477,3 +477,20 @@ func TestRedactionSkipsStreamPayloads(t *testing.T) {
 			"redaction off instead of narrowing it")
 	}
 }
+
+func TestReadJobFileLimitedStopsBeforeTheBody(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.pdf")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{'a'}, 100), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readJobFileLimited(context.Background(), path, 10); !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatalf("over the ceiling: %v", err)
+	}
+	got, err := readJobFileLimited(context.Background(), path, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 100 {
+		t.Fatalf("len %d", len(got))
+	}
+}

@@ -19,7 +19,7 @@ package convert
 // refuses to open. Three other places name it:
 //
 //	1. [Content_Types].xml  -- <Override PartName="/word/vbaProject.bin">,
-//	   and <Default Extension="bin"> once no .bin part remains.
+//	   and <Default Extension="bin"> once no surviving .bin part still needs it.
 //	2. word/_rels/document.xml.rels -- <Relationship … Target="vbaProject.bin">.
 //	   An orphaned relationship breaks opening exactly as reliably as a
 //	   missing content type.
@@ -320,10 +320,37 @@ func resolveTarget(relsPath, target string) string {
 // remover. Neither the sanitizer's own tests nor seven rounds of review had
 // reached it, because the consistency test ran on the un-renamed fixture where
 // the override IS in the drop set.
-func rewriteContentTypes(raw []byte, dropped map[string]bool, survivors map[string]bool, anyBinLeft bool) ([]byte, error) {
+func rewriteContentTypes(raw []byte, dropped map[string]bool, survivors map[string]bool) ([]byte, error) {
 	var t ctTypes
 	if err := xml.Unmarshal(raw, &t); err != nil {
 		return nil, fmt.Errorf("%w: parse [Content_Types].xml: %v", ErrSanitizeMalformedInput, err)
+	}
+
+	covered := map[string]bool{}
+	type keptOverride struct {
+		partName string
+		ct       string
+	}
+	var kept []keptOverride
+	for _, o := range t.Override {
+		part := strings.TrimPrefix(o.PartName, "/")
+		if dropped[part] || !survivors[part] {
+			continue
+		}
+		covered[part] = true
+		ct := o.ContentType
+		if plain, ok := macroEnabledContentTypes[ct]; ok {
+			ct = plain
+		}
+		kept = append(kept, keptOverride{partName: o.PartName, ct: ct})
+	}
+	// OPC applies a Default only to parts that have no Override.
+	binNeedsDefault := false
+	for name := range survivors {
+		if strings.EqualFold(path.Ext(name), ".bin") && !covered[name] {
+			binNeedsDefault = true
+			break
+		}
 	}
 
 	var buf bytes.Buffer
@@ -331,26 +358,15 @@ func rewriteContentTypes(raw []byte, dropped map[string]bool, survivors map[stri
 	buf.WriteString(`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">`)
 
 	for _, d := range t.Defaults {
-		// A Default for an extension no surviving part uses is not fatal to
-		// opening, but it is a dangling declaration of exactly the kind this
-		// file removes elsewhere, and "bin" specifically is the macro one.
-		if strings.EqualFold(d.Extension, "bin") && !anyBinLeft {
+		if strings.EqualFold(d.Extension, "bin") && !binNeedsDefault {
 			continue
 		}
 		fmt.Fprintf(&buf, `<Default Extension="%s" ContentType="%s"/>`,
 			xmlAttr(d.Extension), xmlAttr(d.ContentType))
 	}
-	for _, o := range t.Override {
-		part := strings.TrimPrefix(o.PartName, "/")
-		if dropped[part] || !survivors[part] {
-			continue
-		}
-		ct := o.ContentType
-		if plain, ok := macroEnabledContentTypes[ct]; ok {
-			ct = plain
-		}
+	for _, o := range kept {
 		fmt.Fprintf(&buf, `<Override PartName="%s" ContentType="%s"/>`,
-			xmlAttr(o.PartName), xmlAttr(ct))
+			xmlAttr(o.partName), xmlAttr(o.ct))
 	}
 	buf.WriteString(`</Types>`)
 	return buf.Bytes(), nil
@@ -542,14 +558,6 @@ func sanitizeOOXML(ctx context.Context, _ engineExec, inPath, outPath string) (S
 		survivors[p.name] = true
 	}
 
-	anyBinLeft := false
-	for _, p := range parts {
-		if strings.EqualFold(path.Ext(p.name), ".bin") {
-			anyBinLeft = true
-			break
-		}
-	}
-
 	// Pass 2: rewrite the wiring, then write a new archive.
 	var out bytes.Buffer
 	zw := zip.NewWriter(&out)
@@ -557,7 +565,7 @@ func sanitizeOOXML(ctx context.Context, _ engineExec, inPath, outPath string) (S
 		content := p.content
 		switch {
 		case p.name == "[Content_Types].xml":
-			content, err = rewriteContentTypes(p.content, dropped, survivors, anyBinLeft)
+			content, err = rewriteContentTypes(p.content, dropped, survivors)
 			if err != nil {
 				return SanitizeResult{}, fmt.Errorf("sanitize ooxml: %w", err)
 			}

@@ -641,3 +641,120 @@ func TestLoadOOXMLPartsEnforcesBothCeilings(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 }
+
+func TestSanitizeOOXMLDropsUnusedVBADefault(t *testing.T) {
+	const (
+		settings = "word/printerSettings/printerSettings1.bin"
+		vba      = "word/vbaProject.bin"
+		vbaType  = "application/vnd.ms-office.vbaProject"
+	)
+	contentTypes := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+		`<Default Extension="bin" ContentType="` + vbaType + `"/>` +
+		`<Default Extension="xml" ContentType="application/xml"/>` +
+		`<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>` +
+		`<Override PartName="/word/vbaProject.bin" ContentType="` + vbaType + `"/>` +
+		`<Override PartName="/word/printerSettings/printerSettings1.bin" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.printerSettings"/>` +
+		`</Types>`
+	rels := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+		`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vbaProject" Target="vbaProject.bin"/>` +
+		`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/printerSettings" Target="printerSettings/printerSettings1.bin"/>` +
+		`</Relationships>`
+
+	writeZip := func(t *testing.T, parts map[string][]byte) string {
+		t.Helper()
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		for name, content := range parts {
+			w, err := zw.Create(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write(content); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		in := filepath.Join(t.TempDir(), "in.docm")
+		if err := os.WriteFile(in, buf.Bytes(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return in
+	}
+	partBytes := func(t *testing.T, path, name string) []byte {
+		t.Helper()
+		blob, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		zr, err := zip.NewReader(bytes.NewReader(blob), int64(len(blob)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range zr.File {
+			if f.Name != name {
+				continue
+			}
+			rc, err := f.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			buf, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return buf
+		}
+		t.Fatalf("missing %s", name)
+		return nil
+	}
+
+	in := writeZip(t, map[string][]byte{
+		"[Content_Types].xml":          []byte(contentTypes),
+		"word/document.xml":            []byte(`<?xml version="1.0"?><document/>`),
+		"word/_rels/document.xml.rels": []byte(rels),
+		vba:                            {0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1},
+		settings:                       []byte("settings-blob"),
+	})
+	out := filepath.Join(t.TempDir(), "out.docx")
+	if _, err := sanitizeOOXML(context.Background(), engineExec{}, in, out); err != nil {
+		t.Fatalf("sanitizeOOXML: %v", err)
+	}
+	ct := partBytes(t, out, "[Content_Types].xml")
+	if bytes.Contains(ct, []byte("vbaProject")) {
+		t.Fatalf("unused vba default survived: %s", ct)
+	}
+	if !bytes.Equal(partBytes(t, out, settings), []byte("settings-blob")) {
+		t.Fatal("printer settings part was dropped")
+	}
+	if dangling := ooxmlConsistency(t, mustRead(t, out)); len(dangling) > 0 {
+		t.Fatalf("dangling: %v", dangling)
+	}
+
+	kept := writeZip(t, map[string][]byte{
+		"[Content_Types].xml": []byte(`<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="bin" ContentType="application/octet-stream"/><Default Extension="xml" ContentType="application/xml"/></Types>`),
+		"word/document.xml":   []byte(`<?xml version="1.0"?><document/>`),
+		"word/custom.bin":     []byte("plain-bin"),
+	})
+	keptOut := filepath.Join(t.TempDir(), "kept.docx")
+	if _, err := sanitizeOOXML(context.Background(), engineExec{}, kept, keptOut); err != nil {
+		t.Fatalf("bin without override: %v", err)
+	}
+	keptCT := partBytes(t, keptOut, "[Content_Types].xml")
+	if !bytes.Contains(keptCT, []byte(`Extension="bin"`)) {
+		t.Fatalf("a .bin part with no override lost its default: %s", keptCT)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return blob
+}

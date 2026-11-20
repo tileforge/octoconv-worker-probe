@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -56,6 +57,18 @@ func ReadJobFile(path string) ([]byte, error) {
 	}
 	defer f.Close()
 	return io.ReadAll(f)
+}
+
+func readJobFileLimited(ctx context.Context, path string, max int64) ([]byte, error) {
+	f, info, err := OpenJobFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if info.Size() > max {
+		return nil, ErrOutputTooLarge
+	}
+	return readBounded(ctx, f, max)
 }
 
 func statJobOutput(path string) (fs.FileInfo, error) {
