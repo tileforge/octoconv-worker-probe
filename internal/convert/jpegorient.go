@@ -161,13 +161,30 @@ func orientJPEG(src []byte, orient int) ([]byte, error) {
 	if orient < 2 || orient > 8 {
 		return nil, fmt.Errorf("%w: JPEG EXIF orientation %d", ErrSanitizeMalformedInput, orient)
 	}
-	if cfg, err := jpeg.DecodeConfig(bytes.NewReader(src)); err == nil && cfg.Width > 0 && cfg.Height > jpegOrientMaxPixels/cfg.Width {
+	// image/jpeg rejects a two-component SOF. Ignoring that error still reaches
+	// parseSOF0, which accepts the header and allocates its coefficient blocks.
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(src))
+	if err != nil {
+		return nil, fmt.Errorf("%w: JPEG orientation: %v", ErrSanitizeMalformedInput, err)
+	}
+	if jpegFrameTooLarge(cfg.Width, cfg.Height) {
 		return nil, fmt.Errorf("%w: JPEG orientation frame is too large", ErrSanitizeMalformedInput)
 	}
-	if out, err := orientJPEGLossless(src, orient); err == nil {
+	out, err := orientJPEGLossless(src, orient)
+	if err == nil {
 		return out, nil
 	}
+	if errors.Is(err, ErrSanitizeMalformedInput) {
+		return nil, err
+	}
 	return orientJPEGPixels(src, orient)
+}
+
+func jpegFrameTooLarge(width, height int) bool {
+	if width <= 0 || height <= 0 {
+		return true
+	}
+	return int64(width)*int64(height) > jpegOrientMaxPixels
 }
 
 func orientJPEGPixels(src []byte, orient int) ([]byte, error) {
@@ -403,6 +420,9 @@ func parseSOF0(p []byte) ([]jpegOrientComp, int, int, error) {
 	n := int(p[5])
 	if width <= 0 || height <= 0 || n < 1 || n > 4 || len(p) < 6+3*n {
 		return nil, 0, 0, errJPEGOrientFallback
+	}
+	if jpegFrameTooLarge(width, height) {
+		return nil, 0, 0, fmt.Errorf("%w: JPEG orientation frame is too large", ErrSanitizeMalformedInput)
 	}
 	maxH, maxV := 1, 1
 	comps := make([]jpegOrientComp, n)

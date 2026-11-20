@@ -726,6 +726,28 @@ func TestSanitizeImageAppliesEXIFOrientation(t *testing.T) {
 		}
 	})
 
+	t.Run("two component header is refused", func(t *testing.T) {
+		// 65528 is a multiple of 8, so the coefficient path would allocate
+		// before noticing that image/jpeg rejects two components.
+		payload := []byte{
+			8,
+			0xFF, 0xF8, 0xFF, 0xF8,
+			2,
+			1, 0x11, 0,
+			2, 0x11, 0,
+		}
+		raw := append([]byte{0xFF, 0xD8}, jpegSegment(0xC0, payload)...)
+		raw = append(raw, 0xFF, 0xD9)
+		raw = prependJPEGSegments(t, raw, exifOrientationSegment(6))
+		if _, err := jpeg.DecodeConfig(bytes.NewReader(raw)); err == nil {
+			t.Fatal("DecodeConfig accepted the two-component header")
+		}
+		_, err := stripJPEGMetadata(raw)
+		if !errors.Is(err, ErrSanitizeMalformedInput) {
+			t.Fatalf("stripJPEGMetadata: %v", err)
+		}
+	})
+
 	t.Run("partial mcu keeps icc", func(t *testing.T) {
 		assertColourSurvivesOrientation(t, colorRamp(40, 20), 6, false)
 	})
