@@ -587,6 +587,32 @@ func TestVerifierCatchesRelationshipResidue(t *testing.T) {
 // DELETES the output, it destroyed a correct result rather than mislabelling
 // a job. Too narrow a view misses residue; too broad a predicate invents it,
 // and both cost the client a file.
+func TestVerifierKeepsSpacedOOXMLMemberNames(t *testing.T) {
+	requireVerifierBinaries(t)
+
+	path := buildOOXMLPackage(t, map[string][]byte{
+		"[Content_Types].xml":    []byte(ctWithDocument),
+		"word/document.xml":      []byte(`<?xml version="1.0"?><document/>`),
+		"word/media/image 1.png": []byte("not-a-real-png"),
+	})
+	if _, err := verifySanitized(context.Background(), engineExec{}, "docx", path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnzipMemberNamesKeepSpaces(t *testing.T) {
+	got := unzipMemberNames([]byte("word/media/image 1.png\n[Content_Types].xml\n"))
+	want := []string{"word/media/image 1.png", "[Content_Types].xml"}
+	if len(got) != len(want) {
+		t.Fatalf("names = %#v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("names = %#v", got)
+		}
+	}
+}
+
 func TestVerifierAcceptsCustomXMLParts(t *testing.T) {
 	requireVerifierBinaries(t)
 

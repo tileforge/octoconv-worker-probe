@@ -817,7 +817,7 @@ func verifyOOXML(ctx context.Context, x engineExec, format, path string) ([]Thre
 	if err != nil {
 		return nil, unverifiableEngineFailure(err, "unzip could not list the output")
 	}
-	parts := strings.Fields(strings.TrimSpace(string(listing)))
+	parts := unzipMemberNames(listing)
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("%w: unzip listed no parts in the output",
 			ErrSanitizeUnverifiable)
@@ -991,6 +991,25 @@ func verifyOOXML(ctx context.Context, x engineExec, format, path string) ([]Thre
 	}
 
 	return append([]ThreatClass(nil), ooxmlThreatClasses...), nil
+}
+
+// unzip -Z1 prints one member name per line. A name may contain spaces, so
+// splitting the listing on whitespace turns one member into two paths.
+func unzipMemberNames(listing []byte) []string {
+	text := strings.TrimSuffix(string(listing), "\n")
+	if text == "" {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	parts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			continue
+		}
+		parts = append(parts, line)
+	}
+	return parts
 }
 
 // escapeZipGlob backslash-escapes the characters Info-ZIP reads as wildcards.
