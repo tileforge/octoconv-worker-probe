@@ -17,12 +17,13 @@ package convert
 // surface to mean what its documentation says.
 //
 // Against re-encoding: re-encoding a JPEG decodes and recompresses it, which
-// LOSES QUALITY every time, silently and irreversibly. Plan 60-03 was explicit
-// that quietly degrading the image is not acceptable and that unavoidable loss
-// would have to be reported. Structural stripping makes the question moot --
-// the entropy-coded scan data is copied verbatim, so the pixels that come out
-// are bit-for-bit the pixels that went in. There is no loss to report because
-// there is no loss.
+// loses quality. With no EXIF orientation to apply, structural stripping
+// leaves the entropy-coded scan byte-identical, so that path has nothing to
+// report. An orientation of 2-8 is applied to the raster before APP1 is
+// dropped. An MCU-aligned frame is a coefficient move (jpegorient.go). Any
+// other frame is decoded and encoded again, because the edge block mixes
+// visible samples with encoder padding and a block move would display that
+// padding.
 //
 // The cost of this route is that it is format-specific: each container needs
 // its own walker. That is a real limit and it is why the supported set below
@@ -73,9 +74,25 @@ var imageThreatClasses = []ThreatClass{ThreatDocumentMetadata}
 // guarantee, and docs/SANITIZE.md's scope section says so; it is not a claim
 // this code quietly makes.
 //
-// The scan data after SOS is copied verbatim to the end. That is what makes
-// this lossless: the compressed image is never decoded.
+// stripJPEGMetadata drops metadata segments. An EXIF orientation of 2-8 is
+// applied to the raster first, so deleting APP1 does not change which way
+// the picture displays. Orientation 1 and a missing tag leave the scan
+// byte-identical.
 func stripJPEGMetadata(src []byte) ([]byte, error) {
+	orient, err := jpegEXIFOrientation(src)
+	if err != nil {
+		return nil, err
+	}
+	out, err := stripJPEGSegments(src)
+	if err != nil || orient <= 1 {
+		return out, err
+	}
+	return orientJPEG(out, orient)
+}
+
+// The scan data after SOS is copied verbatim. This function does not decode
+// it. orientJPEG does, when stripJPEGMetadata has an orientation to apply.
+func stripJPEGSegments(src []byte) ([]byte, error) {
 	if len(src) < 2 || src[0] != 0xFF || src[1] != 0xD8 {
 		return nil, fmt.Errorf("%w: not a JPEG (no SOI)", ErrSanitizeMalformedInput)
 	}
@@ -499,9 +516,10 @@ func sanitizeImage(ctx context.Context, _ engineExec, inPath, outPath string) (S
 
 	return SanitizeResult{
 		Removed: append([]ThreatClass(nil), imageThreatClasses...),
-		// Nothing is lost: the compressed image data is copied verbatim, so
-		// there is no quality cost to report. An empty list here is a claim,
-		// and TestSanitizeImageIsLossless is what backs it.
+		// The image vocabulary has no quality-loss entry. The scan is verbatim
+		// when orientation is absent or 1, and an MCU-aligned orientation
+		// does not requantize. TestSanitizeImageIsLossless backs the
+		// verbatim path.
 		LostCapabilities: nil,
 	}, nil
 }

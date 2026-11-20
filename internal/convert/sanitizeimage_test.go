@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"image"
+	"image/color"
 	"image/jpeg"
 	"image/png"
 	"os"
@@ -649,4 +651,298 @@ func TestStripJPEGMetadataRejectsTrailingFill(t *testing.T) {
 	if !errors.Is(err, ErrSanitizeMalformedInput) {
 		t.Fatalf("sanitizeImage: %v", err)
 	}
+}
+
+func TestSanitizeImageAppliesEXIFOrientation(t *testing.T) {
+	t.Run("mcu aligned", func(t *testing.T) {
+		for _, orient := range []int{2, 3, 4, 5, 6, 7, 8} {
+			orient := orient
+			t.Run(fmt.Sprintf("gray/%d", orient), func(t *testing.T) {
+				assertOrientedJPEG(t, grayRamp(16, 8), orient, 2, true)
+			})
+			t.Run(fmt.Sprintf("color/%d", orient), func(t *testing.T) {
+				assertOrientedJPEG(t, colorRamp(32, 16), orient, 12, true)
+			})
+		}
+	})
+
+	t.Run("partial mcu", func(t *testing.T) {
+		// 40x20 is the reported case: 4:2:0 MCU is 16x16, so a coefficient
+		// permutation would drag padding into the visible frame.
+		img := image.NewRGBA(image.Rect(0, 0, 40, 20))
+		for y := 0; y < 20; y++ {
+			for x := 0; x < 40; x++ {
+				c := color.RGBA{R: 220, A: 255}
+				if x >= 20 {
+					c = color.RGBA{B: 220, A: 255}
+				}
+				img.SetRGBA(x, y, c)
+			}
+		}
+		raw := jpegWithOrientation(t, img, 6)
+		out := sanitizeJPEGBytes(t, raw)
+		if bytes.Contains(out, []byte("Exif\x00\x00")) {
+			t.Fatal("EXIF survived")
+		}
+		got := decodeJPEG(t, out)
+		if got.Bounds().Dx() != 20 || got.Bounds().Dy() != 40 {
+			t.Fatalf("size = %v, want 20x40", got.Bounds())
+		}
+		srcQ := jpegQuantTables(t, raw)
+		gotQ := jpegQuantTables(t, out)
+		if len(srcQ) == 0 || quantTablesEqual(srcQ, gotQ) || quantTablesEqual(transposeQuantTables(srcQ), gotQ) {
+			t.Fatalf("partial MCU took the coefficient path: src %d tables, out %d", len(srcQ), len(gotQ))
+		}
+		want := orientRaster(decodeJPEG(t, raw), 6)
+		if d := maxChannelDelta(want, got); d > 8 {
+			t.Fatalf("max channel delta %d, want <= 8", d)
+		}
+	})
+
+	t.Run("orientation 1 keeps the scan", func(t *testing.T) {
+		img := grayRamp(16, 8)
+		plain := jpegWithOrientation(t, img, 0)
+		tagged := jpegWithOrientation(t, img, 1)
+		if !bytes.Equal(scanFromSOS(sanitizeJPEGBytes(t, plain)), scanFromSOS(sanitizeJPEGBytes(t, tagged))) {
+			t.Fatal("orientation 1 rewrote the scan")
+		}
+	})
+
+	t.Run("orientation 9 is refused", func(t *testing.T) {
+		raw := jpegWithOrientation(t, grayRamp(16, 8), 9)
+		_, err := stripJPEGMetadata(raw)
+		if !errors.Is(err, ErrSanitizeMalformedInput) {
+			t.Fatalf("stripJPEGMetadata: %v", err)
+		}
+	})
+
+	t.Run("huge frame is refused", func(t *testing.T) {
+		raw := jpegWithOrientation(t, grayRamp(16, 8), 6)
+		patched := patchSOF0Dimensions(t, raw, 8000, 8000)
+		_, err := stripJPEGMetadata(patched)
+		if !errors.Is(err, ErrSanitizeMalformedInput) {
+			t.Fatalf("stripJPEGMetadata: %v", err)
+		}
+	})
+}
+
+func assertOrientedJPEG(t *testing.T, img image.Image, orient, tol int, lossless bool) {
+	t.Helper()
+	raw := jpegWithOrientation(t, img, orient)
+	out := sanitizeJPEGBytes(t, raw)
+	if bytes.Contains(out, []byte("Exif\x00\x00")) {
+		t.Fatal("EXIF survived")
+	}
+	got := decodeJPEG(t, out)
+	want := orientRaster(decodeJPEG(t, raw), orient)
+	if got.Bounds().Dx() != want.Bounds().Dx() || got.Bounds().Dy() != want.Bounds().Dy() {
+		t.Fatalf("size = %v, want %v", got.Bounds(), want.Bounds())
+	}
+	if d := maxChannelDelta(want, got); d > tol {
+		t.Fatalf("max channel delta %d, want <= %d", d, tol)
+	}
+	srcQ := jpegQuantTables(t, raw)
+	gotQ := jpegQuantTables(t, out)
+	transposed := orient >= 5
+	if lossless {
+		match := srcQ
+		if transposed {
+			match = transposeQuantTables(srcQ)
+		}
+		if !quantTablesEqual(match, gotQ) {
+			t.Fatalf("quant tables = %v path, want coefficient move (transposed=%v)", len(gotQ), transposed)
+		}
+	}
+}
+
+func grayRamp(w, h int) *image.Gray {
+	img := image.NewGray(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Pix[y*img.Stride+x] = uint8((x*17 + y*31) % 251)
+		}
+	}
+	img.Pix[0] = 255
+	img.Pix[w-1] = 0
+	img.Pix[(h-1)*img.Stride] = 0
+	img.Pix[(h-1)*img.Stride+w-1] = 255
+	return img
+}
+
+func colorRamp(w, h int) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetRGBA(x, y, color.RGBA{
+				R: uint8((x * 19) % 251),
+				G: uint8((y * 23) % 251),
+				B: uint8((x*3 + y*5) % 251),
+				A: 255,
+			})
+		}
+	}
+	return img
+}
+
+func jpegWithOrientation(t *testing.T, img image.Image, orient int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 75}); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	if orient == 0 {
+		return raw
+	}
+	app1 := exifOrientationSegment(orient)
+	out := make([]byte, 0, len(raw)+len(app1))
+	out = append(out, raw[:2]...)
+	out = append(out, app1...)
+	out = append(out, raw[2:]...)
+	return out
+}
+
+func patchSOF0Dimensions(t *testing.T, raw []byte, width, height int) []byte {
+	t.Helper()
+	out := append([]byte(nil), raw...)
+	for i := 0; i+8 < len(out); i++ {
+		if out[i] != 0xFF || out[i+1] != 0xC0 {
+			continue
+		}
+		binary.BigEndian.PutUint16(out[i+5:i+7], uint16(height))
+		binary.BigEndian.PutUint16(out[i+7:i+9], uint16(width))
+		return out
+	}
+	t.Fatal("no SOF0")
+	return nil
+}
+
+func exifOrientationSegment(orient int) []byte {
+	// TIFF IFD0, one SHORT orientation tag, big-endian.
+	tiff := []byte{
+		'M', 'M', 0x00, 0x2a,
+		0x00, 0x00, 0x00, 0x08,
+		0x00, 0x01,
+		0x01, 0x12,
+		0x00, 0x03,
+		0x00, 0x00, 0x00, 0x01,
+		0x00, byte(orient), 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
+	payload := append([]byte("Exif\x00\x00"), tiff...)
+	seg := []byte{0xFF, 0xE1, byte((len(payload) + 2) >> 8), byte((len(payload) + 2) & 0xFF)}
+	return append(seg, payload...)
+}
+
+func sanitizeJPEGBytes(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.jpg")
+	out := filepath.Join(dir, "out.jpg")
+	if err := os.WriteFile(in, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := sanitizeImage(context.Background(), engineExec{}, in, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.LostCapabilities) != 0 {
+		t.Fatalf("LostCapabilities = %v", res.LostCapabilities)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if what, found, err := jpegMetadataResidue(got); err != nil || found {
+		t.Fatalf("metadata residue %q: %v", what, err)
+	}
+	return got
+}
+
+func decodeJPEG(t *testing.T, raw []byte) image.Image {
+	t.Helper()
+	img, err := jpeg.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return img
+}
+
+func maxChannelDelta(a, b image.Image) int {
+	ab, bb := a.Bounds(), b.Bounds()
+	if ab.Dx() != bb.Dx() || ab.Dy() != bb.Dy() {
+		return 255
+	}
+	max := 0
+	for y := 0; y < ab.Dy(); y++ {
+		for x := 0; x < ab.Dx(); x++ {
+			ar, ag, abv, _ := a.At(ab.Min.X+x, ab.Min.Y+y).RGBA()
+			br, bg, bbv, _ := b.At(bb.Min.X+x, bb.Min.Y+y).RGBA()
+			for _, d := range []int{absInt(int(ar>>8) - int(br>>8)), absInt(int(ag>>8) - int(bg>>8)), absInt(int(abv>>8) - int(bbv>>8))} {
+				if d > max {
+					max = d
+				}
+			}
+		}
+	}
+	return max
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func scanFromSOS(b []byte) []byte {
+	if i := bytes.Index(b, []byte{0xFF, 0xDA}); i >= 0 {
+		return b[i:]
+	}
+	return nil
+}
+
+func jpegQuantTables(t *testing.T, raw []byte) [][64]byte {
+	t.Helper()
+	var out [][64]byte
+	err := walkJPEGSegments(raw, func(seg jpegMarkerSegment) {
+		if seg.marker != 0xDB {
+			return
+		}
+		p := seg.payload
+		for i := 0; i+65 <= len(p); {
+			if p[i]>>4 != 0 {
+				return
+			}
+			i++
+			var z [64]byte
+			copy(z[:], p[i:i+64])
+			out = append(out, z)
+			i += 64
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func transposeQuantTables(in [][64]byte) [][64]byte {
+	out := make([][64]byte, len(in))
+	for i, z := range in {
+		out[i] = transposeJPEGQuant(z)
+	}
+	return out
+}
+
+func quantTablesEqual(a, b [][64]byte) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
