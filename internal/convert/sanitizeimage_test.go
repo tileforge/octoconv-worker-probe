@@ -14,6 +14,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -732,6 +733,41 @@ func TestSanitizeImageAppliesEXIFOrientation(t *testing.T) {
 	t.Run("aligned mcu keeps icc", func(t *testing.T) {
 		assertColourSurvivesOrientation(t, colorRamp(32, 16), 6, true)
 	})
+
+	t.Run("partial mcu keeps ycbcr adobe", func(t *testing.T) {
+		adobe := append([]byte("Adobe"), 0x00, 0x64, 0, 0, 0, 0, jpegAdobeTransformYCbCr)
+		raw := prependJPEGSegments(t, jpegWithOrientation(t, colorRamp(40, 20), 6), jpegSegment(0xEE, adobe))
+		out := sanitizeJPEGBytes(t, raw)
+		if !bytes.Contains(out, adobe) {
+			t.Fatal("YCbCr APP14 was dropped")
+		}
+	})
+
+	t.Run("rgb adobe is not copied onto ycbcr", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join(runtime.GOROOT(), "src/image/testdata/video-001.rgb.jpeg"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tagged := prependJPEGSegments(t, raw, exifOrientationSegment(6))
+		out := sanitizeJPEGBytes(t, tagged)
+		if err := walkJPEGSegments(out, func(seg jpegMarkerSegment) {
+			if seg.marker == 0xEE {
+				t.Fatal("APP14 survived pixel re-encode")
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got := decodeJPEG(t, out)
+		want := orientRaster(decodeJPEG(t, raw), 6)
+		if got.Bounds().Dx() != want.Bounds().Dx() || got.Bounds().Dy() != want.Bounds().Dy() {
+			t.Fatalf("size = %v, want %v", got.Bounds(), want.Bounds())
+		}
+		// Quality 100 4:2:0 roundtrip of this RGB fixture moves channels by
+		// about 115. Copying transform 0 back moves them by about 200.
+		if d := maxChannelDelta(want, got); d > 140 {
+			t.Fatalf("max channel delta %d, want <= 140", d)
+		}
+	})
 }
 
 func assertColourSurvivesOrientation(t *testing.T, img image.Image, orient int, lossless bool) {
@@ -746,8 +782,12 @@ func assertColourSurvivesOrientation(t *testing.T, img image.Image, orient int, 
 	if !bytes.Contains(out, iccPayload) {
 		t.Fatal("ICC profile was dropped")
 	}
-	if !bytes.Contains(out, adobePayload) {
-		t.Fatal("Adobe APP14 was dropped")
+	if lossless {
+		if !bytes.Contains(out, adobePayload) {
+			t.Fatal("Adobe APP14 was dropped")
+		}
+	} else if bytes.Contains(out, adobePayload) {
+		t.Fatal("non-YCbCr APP14 survived pixel re-encode")
 	}
 	if bytes.Contains(out, []byte("Exif\x00\x00")) {
 		t.Fatal("EXIF survived")

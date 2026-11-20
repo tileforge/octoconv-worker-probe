@@ -12,9 +12,10 @@ package convert
 // this way. The edge block holds both the last visible samples and the
 // encoder's padding, so a block permutation pulls that padding into the new
 // frame. Those files are decoded and encoded again. image/jpeg.Encode writes
-// a new file and does not emit the source APP2 or APP14 segments, so the
-// colour segments already kept in the stripped input are placed back after
-// the new SOI.
+// YCbCr and does not emit APP2, so a complete ICC profile is placed back
+// after the new SOI. An APP14 segment is placed back only when its transform
+// byte is already YCbCr. Transform 0 means RGB, and copying it onto the new
+// file makes a decoder read the YCbCr components as RGB.
 
 import (
 	"bytes"
@@ -32,6 +33,10 @@ var errJPEGOrientFallback = errors.New("jpeg orientation coefficient path does n
 // path stores 256 bytes per block, so an unchecked frame allocates far more
 // than the input length predicts.
 const jpegOrientMaxPixels = 48_000_000
+
+// jpegAdobeTransformYCbCr is the APP14 colour transform value for YCbCr.
+// 0 means RGB and 2 means YCCK. image/jpeg.Encode writes YCbCr.
+const jpegAdobeTransformYCbCr = 1
 
 // jpegUnzig maps a zig-zag index to a natural-order index. ITU-T T.81.
 var jpegUnzig = [64]int{
@@ -195,7 +200,7 @@ func keptJPEGColourSegments(src []byte) ([][]byte, error) {
 		switch {
 		case keepICC && isJPEGICCChunk(seg.marker, seg.payload):
 			kept = append(kept, bytes.Clone(seg.raw))
-		case isKeptJPEGAppSegment(seg.marker, seg.payload):
+		case isKeptJPEGAppSegment(seg.marker, seg.payload) && seg.payload[jpegAdobePayloadLen-1] == jpegAdobeTransformYCbCr:
 			kept = append(kept, bytes.Clone(seg.raw))
 		}
 	})
